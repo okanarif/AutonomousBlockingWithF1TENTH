@@ -1,0 +1,101 @@
+# ====================
+# Python
+# ====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+develop-eggs/
+dist/
+eggs/
+.eggs/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ====================
+# ROS 2 / Colcon
+# ====================
+install/
+build/
+log/
+devel/
+*.bag
+*.db3
+
+# ====================
+# YOLO / ML
+# ====================
+# Pretrained base models
+yolov8*.pt
+yolo11*.pt
+
+# Training run outputs (keep args.yaml for reference)
+runs/detect/*/weights/
+runs/detect/*/results.png
+runs/detect/*/confusion_matrix*.png
+runs/detect/*/*.jpg
+runs/detect/*/*.csv
+
+# All .pt model files — except the deployed opponent detection model
+*.pt
+!lab_ws25/src/opponent_detection/models/*.pt
+
+# ====================
+# Dataset & Video Data
+# ====================
+dataset/images/
+data/frames/
+data/raw_video_data/
+*.mp4
+*.MP4
+*.avi
+*.mov
+*.mkv
+
+# Keep dataset labels and config
+!dataset/labels/**/*.txt
+!dataset/labels/*.cache
+!dataset/data.yaml
+
+# ====================
+# Logs & Temp Files
+# ====================
+*.log
+*.tmp
+*.temp
+*.bak
+
+# ====================
+# IDE & Editor
+# ====================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ====================
+# Jupyter
+# ====================
+.ipynb_checkpoints/
+*.ipynb
+
+# ====================
+# Environment Variables
+# ====================
+.env
+*.env
+
+# ====================
+# OS
+# ====================
+.DS_Store
+Thumbs.db
