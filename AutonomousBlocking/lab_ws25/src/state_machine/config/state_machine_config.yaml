@@ -1,0 +1,55 @@
+simple_state_machine:
+  ros__parameters:
+    selected_topic: "/selected_raceline"
+    max_raceline: 3
+    switch_period_sec: 5.0
+    publish_period_sec: 0.033
+    
+    # Raceline Mode:
+    # 0 = Fixed mode: Use only fixed_raceline_id (no switching)
+    # 1 = Cycling mode: Switch between racelines every switch_period_sec
+    # 2 = Keyboard mode: Control with arrow keys (LEFT/RIGHT)
+    # 3 = Opponent detection mode: Subscribe to opponent detections and print details
+    #     ZED Stereo Camera: 1344x376 pixels (Left: 0-672, Right: 672-1344)
+    #     Detections are classified by camera based on bbox center X position
+    #     Raceline adjusts automatically based on opponent position:
+    #       - Decision CENTER: Keep current raceline (no change)
+    #       - Decision RIGHT: Shift to left raceline (decrease by 1, min=1)
+    #       - Decision LEFT: Shift to right raceline (increase by 1, max=3)
+    #     Initial raceline: 2 (middle)
+    raceline_mode: 3
+    
+    # Fixed raceline ID (used when raceline_mode = 0)
+    fixed_raceline_id: 2
+    
+    # Keyboard input topic (used when raceline_mode = 2)
+    keyboard_topic: "/keyboard_input"
+    
+    # Opponent detection topic (used when raceline_mode = 3)
+    opponent_detection_topic: "/opponent_detections"
+    
+    # Detection print interval in seconds (used when raceline_mode = 3)
+    # Throttles printing to avoid console spam - only prints every N seconds
+    detection_print_interval: 0.5
+    
+    # Raceline change frame threshold (used when raceline_mode = 3)
+    # Requires N consecutive frames with same decision before changing raceline
+    # Helps filter out noise and unstable detections during overtaking
+    # Higher value = more stable but slower response
+    # Lower value = faster response but more susceptible to noise
+    raceline_change_frame_threshold: 1  # frames (e.g., 10 frames = ~0.3s at 30fps)
+    
+    # Detection height threshold for distance estimation (used when raceline_mode = 3)
+    # If bbox height > threshold: opponent is CLOSE
+    # If bbox height <= threshold: opponent is FAR
+    # Larger bbox height means the car appears bigger in image = closer to camera
+    detection_height_threshold: 50.0  # pixels
+    
+    # Detection horizontal position thresholds (used when raceline_mode = 3)
+    # Based on single camera width (672 pixels per camera)
+    # If center_x < min: opponent is on LEFT side
+    # If min <= center_x <= max: opponent is in CENTER
+    # If center_x > max: opponent is on RIGHT side
+    detection_width_threshold_min: 234.0  # pixels (range 0-672)
+    detection_width_threshold_max: 438.0  # pixels (range detection_width_threshold_min-672)
+

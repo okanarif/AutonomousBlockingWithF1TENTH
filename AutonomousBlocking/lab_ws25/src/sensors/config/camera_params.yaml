@@ -1,0 +1,21 @@
+# F1Tenth Camera Configuration Parameters
+# Configure these parameters for your specific camera setup
+
+camera_publisher:
+  ros__parameters:
+    # ROS Topics
+    camera_topic: "/camera/image_raw"  # Output topic for camera images
+    frame_id: "camera"                 # Frame ID for TF
+    
+    # Camera Settings
+    publish_rate: 30.0                 # Publishing frequency in Hz
+    
+    # ZED Camera Native Resolution (Update based on actual camera output)
+    # NOTE: These values are requested, but actual resolution may differ
+    # Check actual resolution with: ros2 topic echo /camera/image_raw
+    # Used camera for F1Tenth is ZED is stereo in VGA mode. width=672, height=376 per eye at total image is 1344x376
+    image_width: 1344                  # Desired/Actual image width
+    image_height: 376                  # Desired/Actual image height
+
+    # Camera Settings
+    camera_index: 0                    # Camera device index (/dev/videoX)

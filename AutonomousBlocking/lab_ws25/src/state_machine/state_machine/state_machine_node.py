@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""Simple state machine: publishes selected raceline id.
+
+This node cycles through raceline ids from 1..max_raceline every switch_period seconds,
+and publishes the current selected raceline every publish_period seconds on `/selected_raceline`.
+"""
+from typing import Optional
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Int32, String
+from vision_msgs.msg import Detection2DArray
+
+
+class SimpleStateMachine(Node):
+    def __init__(self):
+        super().__init__('simple_state_machine')
+
+        # parameters
+        self.declare_parameter('selected_topic', '/selected_raceline')
+        self.declare_parameter('max_raceline', 3)
+        self.declare_parameter('switch_period_sec', 5.0)
+        self.declare_parameter('publish_period_sec', 0.033)
+        self.declare_parameter('raceline_mode', 1)  # 0=fixed, 1=cycling, 2=keyboard, 3=opponent_detection
+        self.declare_parameter('fixed_raceline_id', 2)
+        self.declare_parameter('keyboard_topic', '/keyboard_input')
+        self.declare_parameter('opponent_detection_topic', '/opponent_detections')
+        self.declare_parameter('detection_print_interval', 2.0)
+        self.declare_parameter('raceline_change_frame_threshold', 10)
+        self.declare_parameter('detection_height_threshold', 50.0)
+        self.declare_parameter('detection_width_threshold_min', 224.0)
+        self.declare_parameter('detection_width_threshold_max', 448.0)
+
+        self.selected_topic = self.get_parameter('selected_topic').get_parameter_value().string_value
+        self.max_raceline = int(self.get_parameter('max_raceline').get_parameter_value().integer_value)
+        self.switch_period = float(self.get_parameter('switch_period_sec').get_parameter_value().double_value)
+        self.publish_period = float(self.get_parameter('publish_period_sec').get_parameter_value().double_value)
+        self.raceline_mode = int(self.get_parameter('raceline_mode').get_parameter_value().integer_value)
+        self.fixed_raceline_id = int(self.get_parameter('fixed_raceline_id').get_parameter_value().integer_value)
+        self.keyboard_topic = self.get_parameter('keyboard_topic').get_parameter_value().string_value
+        self.opponent_detection_topic = self.get_parameter('opponent_detection_topic').get_parameter_value().string_value
+        self.detection_print_interval = float(self.get_parameter('detection_print_interval').get_parameter_value().double_value)
+        self.raceline_change_frame_threshold = int(self.get_parameter('raceline_change_frame_threshold').get_parameter_value().integer_value)
+        self.detection_height_threshold = float(self.get_parameter('detection_height_threshold').get_parameter_value().double_value)
+        self.detection_width_threshold_min = float(self.get_parameter('detection_width_threshold_min').get_parameter_value().double_value)
+        self.detection_width_threshold_max = float(self.get_parameter('detection_width_threshold_max').get_parameter_value().double_value)
+
+        self.pub = self.create_publisher(Int32, self.selected_topic, 10)
+        
+        # Keyboard subscriber (for mode 2)
+        if self.raceline_mode == 2:
+            self.keyboard_sub = self.create_subscription(
+                String, self.keyboard_topic, self.keyboard_callback, 10
+            )
+        
+        # Opponent detection subscriber (for mode 3)
+        if self.raceline_mode == 3:
+            self.opponent_sub = self.create_subscription(
+                Detection2DArray, self.opponent_detection_topic, self.opponent_detection_callback, 10
+            )
+            self.detection_count = 0  # Counter for received detections
+            
+            # Decision history buffer for frame threshold filtering
+            self.decision_history = []  # List of recent decisions
+            self.decision_buffer_max = self.raceline_change_frame_threshold
+            
+            # ZED camera stereo image parameters
+            self.image_width = 1344  # Total width of stereo image
+            self.image_height = 376  # Height of stereo image
+            self.center_divider = self.image_width / 2  # 672 pixels - divides left/right cameras
+            
+            # Throttling for printing (print every N seconds from config)
+            self.print_interval = self.detection_print_interval
+            self.last_print_time = self.get_clock().now()
+            self.latest_detection_msg = None
+
+        self.current = self.fixed_raceline_id
+        # Set initial raceline based on mode
+        #if self.raceline_mode == 0:
+        #    self.current = self.fixed_raceline_id
+        #else:
+        #    self.current = 1
+        
+        # Timer to switch raceline every switch_period seconds (only in cycling mode)
+        if self.raceline_mode == 1:
+            self.switch_timer = self.create_timer(self.switch_period, self.switch_raceline_cb)
+        
+        # Timer to publish current raceline every publish_period seconds
+        self.publish_timer = self.create_timer(self.publish_period, self.publish_raceline_cb)
+        
+        if self.raceline_mode == 0:
+            self.get_logger().info(
+                f'SimpleStateMachine [FIXED MODE]: Using raceline {self.fixed_raceline_id} only, '
+                f'publishing to {self.selected_topic} every {self.publish_period}s'
+            )
+        elif self.raceline_mode == 1:
+            self.get_logger().info(
+                f'SimpleStateMachine [CYCLING MODE]: switching raceline every {self.switch_period}s, '
+                f'publishing to {self.selected_topic} every {self.publish_period}s (1..{self.max_raceline})'
+            )
+        elif self.raceline_mode == 2:
+            self.get_logger().info(
+                f'SimpleStateMachine [KEYBOARD MODE]: Use arrow keys to control, '
+                f'listening on {self.keyboard_topic}, publishing to {self.selected_topic} every {self.publish_period}s (1..{self.max_raceline})'
+            )
+        elif self.raceline_mode == 3:
+            self.get_logger().info(
+                f'SimpleStateMachine [OPPONENT DETECTION MODE]: Monitoring opponent detections, '
+                f'listening on {self.opponent_detection_topic}, publishing to {self.selected_topic} every {self.publish_period}s'
+            )
+            self.get_logger().info(
+                f'ZED Stereo Camera: {self.image_width}x{self.image_height} pixels '
+                f'(Left: 0-{int(self.center_divider)}, Right: {int(self.center_divider)}-{self.image_width})'
+            )
+            self.get_logger().info(f'Detection print interval: {self.print_interval}s (throttled for readability)')
+            self.get_logger().info(
+                f'Distance estimation threshold: {self.detection_height_threshold} pixels '
+                f'(height > {self.detection_height_threshold}px = CLOSE, <= {self.detection_height_threshold}px = FAR)'
+            )
+            self.get_logger().info(
+                f'Horizontal position thresholds: LEFT < {self.detection_width_threshold_min}px, '
+                f'CENTER {self.detection_width_threshold_min}-{self.detection_width_threshold_max}px, '
+                f'RIGHT > {self.detection_width_threshold_max}px'
+            )
+            self.get_logger().info(
+                f'Raceline change threshold: {self.raceline_change_frame_threshold} consecutive frames '
+                f'(noise filtering enabled)'
+            )
+
+    def switch_raceline_cb(self):
+        """Switch to next raceline every switch_period seconds (only in cycling mode)"""
+        if self.raceline_mode == 1:
+            self.current = (self.current % self.max_raceline) + 1
+            self.get_logger().info(f'🔄 Raceline CHANGED → raceline={self.current}')
+    
+    def keyboard_callback(self, msg):
+        """Handle keyboard arrow keys for raceline switching"""
+        if self.raceline_mode != 2:
+            return
+        
+        if msg.data == 'left':
+            self.change_raceline(-1)
+        elif msg.data == 'right':
+            self.change_raceline(1)
+    
+    def opponent_detection_callback(self, msg):
+        """Handle opponent detection messages and print details (throttled to 2 seconds)"""
+        if self.raceline_mode != 3:
+            return
+        
+        # Store the latest detection message
+        self.latest_detection_msg = msg
+        
+        # Check if enough time has passed since last print
+        current_time = self.get_clock().now()
+        time_since_last_print = (current_time - self.last_print_time).nanoseconds / 1e9
+        
+        if time_since_last_print < self.print_interval:
+            # Skip printing, but update the stored message
+            return
+        
+        # Update last print time
+        self.last_print_time = current_time
+        self.detection_count += 1
+        
+        num_detections = len(msg.detections)
+        
+        # Separate detections by camera (left vs right)
+        left_detections = []
+        right_detections = []
+        left_positions = []  # Store horizontal positions for left camera
+        right_positions = []  # Store horizontal positions for right camera
+        
+        for detection in msg.detections:
+            bbox = detection.bbox
+            center_x = bbox.center.x
+            
+            # Determine which camera based on center X position
+            if center_x < self.center_divider:
+                left_detections.append(detection)
+                # Calculate position for left camera
+                camera_x = center_x
+                position = self._get_horizontal_position(camera_x)
+                left_positions.append(position)
+            else:
+                right_detections.append(detection)
+                # Calculate position for right camera
+                camera_x = center_x - self.center_divider
+                position = self._get_horizontal_position(camera_x)
+                right_positions.append(position)
+        
+        # Make decision based on detections from both cameras
+        final_decision = self._make_decision(left_positions, right_positions)
+        
+        # Add decision to history buffer
+        self.decision_history.append(final_decision)
+        
+        # Keep buffer size limited
+        if len(self.decision_history) > self.decision_buffer_max:
+            self.decision_history.pop(0)
+        
+        # Check if we should update raceline (requires threshold consecutive same decisions)
+        should_update, stable_decision = self._check_decision_stability()
+        
+        # Update raceline based on stable decision (Mode 3 only)
+        previous_raceline = self.current
+        if should_update:
+            self._update_raceline_from_decision(stable_decision)
+        
+        # Print header
+        self.get_logger().info('=' * 80)
+        self.get_logger().info(f'🚗 OPPONENT DETECTION #{self.detection_count}')
+        self.get_logger().info(f'   Timestamp: {msg.header.stamp.sec}.{msg.header.stamp.nanosec}')
+        self.get_logger().info(f'   Frame ID: {msg.header.frame_id}')
+        self.get_logger().info(f'   Total detections: {num_detections} (Left: {len(left_detections)}, Right: {len(right_detections)})')
+        self.get_logger().info('')
+        self.get_logger().info(f'🎯 CURRENT DECISION: {final_decision}')
+        self.get_logger().info(f'📊 DECISION BUFFER: {len(self.decision_history)}/{self.decision_buffer_max} frames')
+        if should_update:
+            self.get_logger().info(f'✅ STABLE DECISION: {stable_decision} (threshold reached)')
+            self.get_logger().info(f'📍 RACELINE: {previous_raceline} → {self.current} {self._get_raceline_change_indicator(previous_raceline, self.current)}')
+        else:
+            self.get_logger().info(f'⏳ WAITING FOR STABILITY: Need {self.raceline_change_frame_threshold - len(self.decision_history)} more frames')
+            self.get_logger().info(f'📍 RACELINE: {self.current} (unchanged)')
+        self.get_logger().info('=' * 80)
+        
+        if num_detections == 0:
+            self.get_logger().info('   ℹ️  No opponent cars detected')
+        else:
+            # Print LEFT camera detections
+            if len(left_detections) > 0:
+                self.get_logger().info('')
+                self.get_logger().info('📷 LEFT CAMERA DETECTIONS:')
+                self.get_logger().info('-' * 80)
+                for idx, detection in enumerate(left_detections, 1):
+                    self._print_detection_details(detection, idx, 'LEFT')
+            
+            # Print RIGHT camera detections
+            if len(right_detections) > 0:
+                self.get_logger().info('')
+                self.get_logger().info('📷 RIGHT CAMERA DETECTIONS:')
+                self.get_logger().info('-' * 80)
+                for idx, detection in enumerate(right_detections, 1):
+                    self._print_detection_details(detection, idx, 'RIGHT')
+        
+        self.get_logger().info('=' * 80)
+    
+    def _check_decision_stability(self):
+        """Check if decision history is stable enough to trigger raceline change
+        
+        Returns:
+            tuple: (should_update: bool, stable_decision: str)
+                - should_update: True if threshold reached with consistent decision
+                - stable_decision: The stable decision string (or None if not stable)
+        
+        Logic:
+            - Requires exactly raceline_change_frame_threshold frames in buffer
+            - All frames must have the same decision direction (LEFT/RIGHT/CENTER/NO OPPONENT)
+            - Extracts decision direction by taking first word of decision string
+        """
+        # Need full buffer
+        if len(self.decision_history) < self.decision_buffer_max:
+            return False, None
+        
+        # Extract decision directions (first word: LEFT/RIGHT/CENTER/NO)
+        decision_directions = []
+        for decision in self.decision_history:
+            # Extract first word (LEFT, RIGHT, CENTER, or NO)
+            direction = decision.split()[0]
+            decision_directions.append(direction)
+        
+        # Check if all decisions are the same
+        first_decision = decision_directions[0]
+        all_same = all(d == first_decision for d in decision_directions)
+        
+        if all_same:
+            # Return the full decision string from the most recent frame
+            return True, self.decision_history[-1]
+        else:
+            return False, None
+    
+    def _update_raceline_from_decision(self, decision):
+        """Update current raceline based on decision
+        
+        Args:
+            decision: Decision string containing LEFT, CENTER, or RIGHT
+            
+        Logic:
+            - CENTER: Keep current raceline (no change)
+            - RIGHT: Decrease raceline by 1 (shift left, min = 1)
+            - LEFT: Increase raceline by 1 (shift right, max = max_raceline)
+            - NO OPPONENT: Keep current raceline
+        """
+        old_raceline = self.current
+        
+        if "CENTER" in decision or "NO OPPONENT" in decision:
+            # Keep current raceline
+            pass
+        elif "RIGHT" in decision:
+            # Opponent on right → shift to left raceline (decrease)
+            self.current = max(1, self.current - 1)
+        elif "LEFT" in decision:
+            # Opponent on left → shift to right raceline (increase)
+            self.current = min(self.max_raceline, self.current + 1)
+        
+        # Log raceline change if it happened
+        if old_raceline != self.current:
+            self.get_logger().info(
+                f'🔄 Raceline adjusted: {old_raceline} → {self.current} '
+                f'(Decision: {decision.split()[0]})'
+            )
+            # Clear decision history buffer after raceline change
+            # This allows fresh evaluation in new raceline position
+            self.decision_history.clear()
+            self.get_logger().info(f'🔄 Decision buffer cleared for fresh evaluation')
+    
+    def _get_raceline_change_indicator(self, old_raceline, new_raceline):
+        """Get emoji indicator for raceline change
+        
+        Args:
+            old_raceline: Previous raceline ID
+            new_raceline: Current raceline ID
+            
+        Returns:
+            str: Emoji indicator
+        """
+        if new_raceline < old_raceline:
+            return '⬅️ (Shifted Left)'
+        elif new_raceline > old_raceline:
+            return '➡️ (Shifted Right)'
+        else:
+            return '↔️ (No Change)'
+    
+    def _get_horizontal_position(self, camera_x):
+        """Determine horizontal position based on camera X coordinate
+        
+        Args:
+            camera_x: X coordinate within single camera (0-672)
+            
+        Returns:
+            str: 'LEFT', 'CENTER', or 'RIGHT'
+        """
+        if camera_x < self.detection_width_threshold_min:
+            return 'LEFT'
+        elif camera_x <= self.detection_width_threshold_max:
+            return 'CENTER'
+        else:
+            return 'RIGHT'
+    
+    def _make_decision(self, left_positions, right_positions):
+        """Make final decision based on detections from both cameras
+        
+        Args:
+            left_positions: List of positions from left camera ['LEFT', 'CENTER', 'RIGHT']
+            right_positions: List of positions from right camera ['LEFT', 'CENTER', 'RIGHT']
+            
+        Returns:
+            str: Final decision with emoji
+            
+        Logic:
+            - If both cameras have detections and agree: use that position
+            - If both cameras have detections but disagree: CENTER (default safe choice)
+            - If only one camera has detection: use that detection's position
+            - If no detections: NO OPPONENT DETECTED
+        """
+        has_left = len(left_positions) > 0
+        has_right = len(right_positions) > 0
+        
+        if not has_left and not has_right:
+            self.current = 2
+            return "NO OPPONENT DETECTED ✅"
+        
+        # Only left camera has detection
+        if has_left and not has_right:
+            # Use the most common position from left camera
+            decision = self._most_common(left_positions)
+            return f"{decision} {self._get_position_emoji(decision)} (Left Camera Only)"
+        
+        # Only right camera has detection
+        if has_right and not has_left:
+            # Use the most common position from right camera
+            decision = self._most_common(right_positions)
+            return f"{decision} {self._get_position_emoji(decision)} (Right Camera Only)"
+        
+        # Both cameras have detections
+        left_decision = self._most_common(left_positions)
+        right_decision = self._most_common(right_positions)
+        
+        if left_decision == right_decision:
+            # Both cameras agree
+            return f"{left_decision} {self._get_position_emoji(left_decision)} (Both Cameras Agree ✓)"
+        else:
+            # Cameras disagree - default to CENTER for safety
+            return f"CENTER 🎯 (Cameras Disagree: L={left_decision}, R={right_decision})"
+    
+    def _most_common(self, positions):
+        """Find the most common position in a list
+        
+        Args:
+            positions: List of position strings
+            
+        Returns:
+            str: Most common position
+        """
+        if not positions:
+            return 'CENTER'
+        
+        # Count occurrences
+        counts = {}
+        for pos in positions:
+            counts[pos] = counts.get(pos, 0) + 1
+        
+        # Return most common
+        return max(counts, key=counts.get)
+    
+    def _get_position_emoji(self, position):
+        """Get emoji for position
+        
+        Args:
+            position: Position string ('LEFT', 'CENTER', 'RIGHT')
+            
+        Returns:
+            str: Emoji
+        """
+        if position == 'LEFT':
+            return '⬅️'
+        elif position == 'CENTER':
+            return '🎯'
+        elif position == 'RIGHT':
+            return '➡️'
+        else:
+            return '❓'
+    
+    def _print_detection_details(self, detection, idx, camera_side):
+        """Helper function to print detection details
+        
+        Args:
+            detection: Detection2D message
+            idx: Detection index number
+            camera_side: 'LEFT' or 'RIGHT'
+        """
+        bbox = detection.bbox
+        center_x = bbox.center.x
+        center_y = bbox.center.y
+        #width = bbox.size_x
+        #height = bbox.size_y
+
+        width = bbox.size_y
+        height = bbox.size_x
+        
+        # Calculate normalized position within the specific camera (0-672 pixels)
+        if camera_side == 'LEFT':
+            camera_x = center_x  # Already in 0-672 range
+            normalized_x = center_x / self.center_divider
+        else:  # RIGHT
+            camera_x = center_x - self.center_divider  # Convert to 0-672 range
+            normalized_x = camera_x / self.center_divider
+        
+        normalized_y = center_y / self.image_height
+        
+        # Get confidence score if available
+        confidence = 0.0
+        class_id = "unknown"
+        if detection.results and len(detection.results) > 0:
+            confidence = detection.results[0].score
+            class_id = detection.results[0].id
+        
+        # Calculate bounding box corners
+        x1 = center_x - width / 2
+        y1 = center_y - height / 2
+        x2 = center_x + width / 2
+        y2 = center_y + height / 2
+        
+        # Estimate distance based on bounding box height
+        if height > self.detection_height_threshold:
+            distance_estimate = "CLOSE 🔴"
+            distance_indicator = "⚠️ "
+        else:
+            distance_estimate = "FAR 🟢"
+            distance_indicator = "ℹ️  "
+        
+        # Determine horizontal position (LEFT/CENTER/RIGHT) within the camera
+        if camera_x < self.detection_width_threshold_min:
+            horizontal_position = "LEFT ⬅️"
+            position_indicator = "◀️ "
+        elif camera_x <= self.detection_width_threshold_max:
+            horizontal_position = "CENTER ⬆️"
+            position_indicator = "🎯 "
+        else:
+            horizontal_position = "RIGHT ➡️"
+            position_indicator = "▶️ "
+        
+        self.get_logger().info(f'   Detection {idx}:')
+        self.get_logger().info(f'      Class: {class_id}')
+        self.get_logger().info(f'      Confidence: {confidence:.2%}')
+        self.get_logger().info(f'      Camera: {camera_side}')
+        self.get_logger().info(f'      {distance_indicator}Distance Estimate: {distance_estimate}')
+        self.get_logger().info(f'      {position_indicator}Horizontal Position: {horizontal_position}')
+        self.get_logger().info(f'      Bounding Box:')
+        self.get_logger().info(f'         Center (Stereo): ({center_x:.1f}, {center_y:.1f}) pixels')
+        self.get_logger().info(f'         Center (Single Camera): ({camera_x:.1f}, {center_y:.1f}) pixels')
+        self.get_logger().info(f'         Normalized (Camera): ({normalized_x:.3f}, {normalized_y:.3f})')
+        self.get_logger().info(f'         Size: {width:.1f} x {height:.1f} pixels')
+        self.get_logger().info(f'         Area: {width * height:.0f} pixels²')
+        self.get_logger().info(f'         Corners (Stereo): ({x1:.1f}, {y1:.1f}) to ({x2:.1f}, {y2:.1f})')
+        self.get_logger().info(f'      ---')
+    
+    def change_raceline(self, direction):
+        """Change raceline with bounds checking
+        
+        Args:
+            direction: -1 for left (decrease), +1 for right (increase)
+        """
+        new_raceline = self.current + direction
+        
+        # Check bounds
+        if new_raceline < 1:
+            self.get_logger().warn(f'⚠️  Already at leftmost raceline (1) - Cannot decrease!')
+            return
+        
+        if new_raceline > self.max_raceline:
+            self.get_logger().warn(f'⚠️  Already at rightmost raceline ({self.max_raceline}) - Cannot increase!')
+            return
+        
+        # Update and publish
+        self.current = new_raceline
+        direction_arrow = '⬅️' if direction < 0 else '➡️'
+        self.get_logger().info(f'{direction_arrow}  Raceline changed: {self.current - direction} → {self.current}')
+        
+        # Immediate publish
+        self.publish_raceline_cb()
+
+    def publish_raceline_cb(self):
+        """Publish current raceline every publish_period seconds"""
+        msg = Int32()
+        msg.data = int(self.current)
+        self.pub.publish(msg)
+        # Silent publish - only log on raceline change
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = SimpleStateMachine()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

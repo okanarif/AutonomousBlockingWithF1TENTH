@@ -1,0 +1,6 @@
+path: /home/okanarif/repositories/AutonomousBlockingWithF1TENTH/Perception Opponent Training/dataset
+train: images/train
+val: images/val
+
+names:
+  0: opponent_car
